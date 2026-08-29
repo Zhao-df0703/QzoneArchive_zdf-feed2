@@ -24,6 +24,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: npm ci
       - run: npx tauri build --bundles nsis
+      - name: Rename artifacts with platform prefix
+        shell: pwsh
+        run: |
+          $dir = "src-tauri/target/release/bundle/nsis"
+          Get-ChildItem "$dir/*.exe" | ForEach-Object {
+            Rename-Item $_.FullName "windows_x64_$($_.Name)"
+          }
       - uses: actions/upload-artifact@v4
         with:
           name: qzonearchive-windows-${{ github.sha }}
@@ -38,8 +45,10 @@ jobs:
         include:
           - target: x86_64-apple-darwin
             artifact: macos-x64
+            arch: x64
           - target: aarch64-apple-darwin
             artifact: macos-arm64
+            arch: arm64
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -52,6 +61,12 @@ jobs:
           targets: ${{ matrix.target }}
       - run: npm ci
       - run: npx tauri build --target ${{ matrix.target }} --bundles dmg
+      - name: Rename artifacts with platform prefix
+        run: |
+          DMG_DIR="src-tauri/target/${{ matrix.target }}/release/bundle/dmg"
+          for f in "$DMG_DIR"/*.dmg; do
+            mv "$f" "$DMG_DIR/macos_${{ matrix.arch }}_$(basename "$f")"
+          done
       - uses: actions/upload-artifact@v4
         with:
           name: qzonearchive-${{ matrix.artifact }}-${{ github.sha }}
@@ -60,7 +75,17 @@ jobs:
           retention-days: 90
 
   linux:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            artifact: linux_x64
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            artifact: linux_arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -68,6 +93,8 @@ jobs:
           node-version: 22
           cache: npm
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
       - name: Install Linux build dependencies
         run: |
           sudo apt-get update
@@ -75,16 +102,30 @@ jobs:
             libwebkit2gtk-4.1-dev \
             libayatana-appindicator3-dev \
             librsvg2-dev \
-            patchelf
+            patchelf \
+            xdg-utils
       - run: npm ci
-      - run: npx tauri build --bundles appimage,deb,rpm
+      - run: npx tauri build --target ${{ matrix.target }} --bundles appimage,deb,rpm
+      - name: Rename Linux artifacts with platform prefix
+        run: |
+          set -euo pipefail
+          BUNDLE_DIR="src-tauri/target/${{ matrix.target }}/release/bundle"
+          PLATFORM="${{ matrix.artifact }}"  # e.g. linux_x64, linux_arm64
+          for dir in appimage deb rpm; do
+            [ -d "$BUNDLE_DIR/$dir" ] || continue
+            for f in "$BUNDLE_DIR/$dir"/*; do
+              [ -f "$f" ] || continue
+              base="$(basename "$f")"
+              mv "$f" "$BUNDLE_DIR/$dir/${PLATFORM}_${base}"
+            done
+          done
       - uses: actions/upload-artifact@v4
         with:
-          name: qzonearchive-linux-${{ github.sha }}
+          name: qzonearchive-${{ matrix.artifact }}-${{ github.sha }}
           path: |
-            src-tauri/target/release/bundle/appimage/*.AppImage
-            src-tauri/target/release/bundle/deb/*.deb
-            src-tauri/target/release/bundle/rpm/*.rpm
+            src-tauri/target/${{ matrix.target }}/release/bundle/appimage/*.AppImage
+            src-tauri/target/${{ matrix.target }}/release/bundle/deb/*.deb
+            src-tauri/target/${{ matrix.target }}/release/bundle/rpm/*.rpm
           if-no-files-found: error
           retention-days: 90
 
@@ -129,10 +170,14 @@ jobs:
             --out "$signed_apk" \
             "$unsigned_apk"
           "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify "$signed_apk"
+      - name: Rename artifact with platform prefix
+        run: |
+          APK_DIR="src-tauri/gen/android/app/build/outputs/apk/universal/release"
+          mv "$APK_DIR/app-universal-release.apk" "$APK_DIR/android_arm64_app-universal-release.apk"
       - uses: actions/upload-artifact@v4
         with:
           name: qzonearchive-android-${{ github.sha }}
-          path: src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release.apk
+          path: src-tauri/gen/android/app/build/outputs/apk/universal/release/android_arm64_*.apk
           if-no-files-found: error
           retention-days: 90
 
@@ -150,6 +195,12 @@ jobs:
       - run: npm ci
       - run: npx tauri ios init --ci
       - run: npx tauri ios build --target aarch64 --ci --no-sign
+      - name: Rename artifact with platform prefix
+        run: |
+          IPA_DIR="src-tauri/gen/apple"
+          for f in "$IPA_DIR"/**/*.ipa; do
+            mv "$f" "$IPA_DIR/ios_arm64_$(basename "$f")"
+          done
       - uses: actions/upload-artifact@v4
         with:
           name: qzonearchive-ios-unsigned-${{ github.sha }}
@@ -186,11 +237,11 @@ jobs:
           echo "QzoneArchive installed. Run qzonearchive to start it."
           EOF
           chmod +x dist/nix/install.sh
-          tar -czf dist/qzonearchive-nixos-x86_64-linux.tar.gz -C dist/nix .
+          tar -czf dist/nixos_x64_qzonearchive-nixos-x86_64-linux.tar.gz -C dist/nix .
       - uses: actions/upload-artifact@v4
         with:
           name: qzonearchive-nixos-${{ github.sha }}
-          path: dist/qzonearchive-nixos-x86_64-linux.tar.gz
+          path: dist/nixos_x64_*.tar.gz
           if-no-files-found: error
           retention-days: 90
 
@@ -215,8 +266,12 @@ jobs:
           path: artifacts/macos-arm64
       - uses: actions/download-artifact@v7
         with:
-          name: qzonearchive-linux-${{ github.sha }}
-          path: artifacts/linux
+          name: qzonearchive-linux-x64-${{ github.sha }}
+          path: artifacts/linux-x64
+      - uses: actions/download-artifact@v7
+        with:
+          name: qzonearchive-linux-arm64-${{ github.sha }}
+          path: artifacts/linux-arm64
       - uses: actions/download-artifact@v7
         with:
           name: qzonearchive-android-${{ github.sha }}
@@ -235,15 +290,17 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p nightly
-          cp artifacts/windows/*.exe nightly/QzoneArchive-nightly_x64-setup.exe
-          cp artifacts/macos-x64/*.dmg nightly/QzoneArchive-nightly_x64.dmg
-          cp artifacts/macos-arm64/*.dmg nightly/QzoneArchive-nightly_aarch64.dmg
-          cp artifacts/linux/*.AppImage nightly/QzoneArchive-nightly_amd64.AppImage
-          cp artifacts/linux/*.deb nightly/QzoneArchive-nightly_amd64.deb
-          cp artifacts/linux/*.rpm nightly/QzoneArchive-nightly_x86_64.rpm
-          cp artifacts/android/*.apk nightly/QzoneArchive-nightly-universal.apk
-          cp artifacts/ios-unsigned/*.ipa nightly/QzoneArchive-nightly-ios-arm64-unsigned.ipa
-          cp artifacts/nixos/*.tar.gz nightly/qzonearchive-nixos-nightly-x86_64-linux.tar.gz
+          cp artifacts/windows/*.exe nightly/
+          cp artifacts/macos-x64/*.dmg nightly/
+          cp artifacts/macos-arm64/*.dmg nightly/
+          cp artifacts/linux-x64/linux_x64_*.AppImage nightly/
+          cp artifacts/linux-x64/linux_x64_*.deb nightly/
+          cp artifacts/linux-x64/linux_x64_*.rpm nightly/
+          cp artifacts/linux-arm64/linux_arm64_*.AppImage nightly/
+          cp artifacts/linux-arm64/linux_arm64_*.deb nightly/
+          cp artifacts/android/*.apk nightly/
+          cp artifacts/ios-unsigned/*.ipa nightly/
+          cp artifacts/nixos/*.tar.gz nightly/
           ls -lh nightly
           gh release create nightly \
             --repo "$GITHUB_REPOSITORY" \
