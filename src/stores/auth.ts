@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { defineStore } from "pinia";
 import { computed, ref } from "vue";
 import { getQzoneLoginUser, type LoginCredentials, openWebLogin, checkWebLogin, syncCookiesToWebview } from "../utils/qlogin";
+import { resetArchiveSession } from "../utils/qzone";
 import { useRecycleSessionStore } from "./recycle";
 
 export interface LoginUser {
@@ -168,6 +169,7 @@ export const useAuthStore = defineStore("auth", () => {
     loading.value = true;
     dialogVisible.value = false;
     try {
+      await resetArchiveSession().catch(() => undefined);
       await invoke("logout_qzone");
     } finally {
       useRecycleSessionStore().clear();

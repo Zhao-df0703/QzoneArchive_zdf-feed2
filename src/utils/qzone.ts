@@ -36,7 +36,10 @@ export interface ArchiveComment { uin?: string; nickname?: string; content: stri
 export type ArchiveCategory = "self" | "other" | "guestbook";
 export interface ArchiveMediaItem { key: string; dynamicId: number; mediaType: "photo" | "video"; pictureIndex?: number; url: string; coverUrl?: string; publishedAt: number; authorUin?: string; authorName?: string; content?: string; }
 export interface ArchiveMediaPage { items: ArchiveMediaItem[]; total: number; years: number[]; }
-export const startFeedArchive = (intervalMs: number) => invoke<ArchiveProgress>("start_feed_archive", { intervalMs });
+export interface ArchiveDepthOption { targetYear: number; maxOffset: number; label: string; }
+export const listArchiveDepthOptions = () => invoke<ArchiveDepthOption[]>("list_archive_depth_options");
+export const resetArchiveSession = () => invoke<void>("reset_archive_session");
+export const startFeedArchive = (intervalMs: number, targetYear?: number) => invoke<ArchiveProgress>("start_feed_archive", { intervalMs, targetYear });
 export const getArchiveProgress = () => invoke<ArchiveProgress>("get_archive_progress");
 export const cancelFeedArchive = () => invoke<void>("cancel_feed_archive");
 export const listArchiveSkips = () => invoke<ArchiveSkipItem[]>("list_archive_skips");
