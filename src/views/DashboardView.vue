@@ -58,6 +58,7 @@ async function loadDashboard() {
 }
 function primaryAction() { loggedIn.value ? router.push("/tasks") : authStore.openLogin(); }
 watch(loggedIn, loadDashboard);
+watch(() => user.value?.uin, loadDashboard);
 onMounted(loadDashboard);
 onBeforeUnmount(releaseAvatars);
 </script>

@@ -1,4 +1,5 @@
 mod archive;
+mod feeds2;
 mod qlogin;
 mod qzone;
 
@@ -41,6 +42,8 @@ pub fn run() {
             qzone::recover_recycle_photos,
             archive::start_feed_archive,
             archive::get_archive_progress,
+            archive::reset_archive_session,
+            archive::list_archive_depth_options,
             archive::cancel_feed_archive,
             archive::list_archive_skips,
             archive::clear_resolved_archive_skips,

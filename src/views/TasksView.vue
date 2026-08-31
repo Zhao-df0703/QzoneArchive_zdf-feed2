@@ -1,18 +1,19 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { storeToRefs } from "pinia";
 import Button from "primevue/button";
 import ProgressBar from "primevue/progressbar";
+import Select from "primevue/select";
 import Tag from "primevue/tag";
 import {
-  cancelFeedArchive, clearResolvedArchiveSkips, getArchiveProgress, listArchiveSkips, retryAllArchiveSkips, retryArchiveSkip, startFeedArchive,
-  type ArchiveProgress, type ArchiveSkipItem,
+  cancelFeedArchive, clearResolvedArchiveSkips, getArchiveProgress, listArchiveDepthOptions, listArchiveSkips, retryAllArchiveSkips, retryArchiveSkip, startFeedArchive,
+  type ArchiveDepthOption, type ArchiveProgress, type ArchiveSkipItem,
 } from "../utils/qzone";
 import { useAuthStore } from "../stores/auth";
-import { getArchiveInterval } from "../utils/appSettings";
+import { getArchiveInterval, getArchiveTargetYear, setArchiveTargetYear } from "../utils/appSettings";
 
 const authStore = useAuthStore();
-const { loggedIn } = storeToRefs(authStore);
+const { loggedIn, user } = storeToRefs(authStore);
 const progress = ref<ArchiveProgress>({ status: "idle", pages: 0, fetched: 0, saved: 0, skipped: 0, message: "尚未开始归档" });
 const skips = ref<ArchiveSkipItem[]>([]);
 const retryingId = ref<number>();
@@ -21,6 +22,8 @@ const skipFilter = ref<"all" | "pending" | "resolved">("all");
 const clearingResolved = ref(false);
 const batchRetrying = ref(false);
 const batchStopping = ref(false);
+const depthOptions = ref<ArchiveDepthOption[]>([]);
+const targetYear = ref(getArchiveTargetYear());
 const currentTime = ref(Date.now());
 let timer: number | undefined;
 const running = computed(() => progress.value.status === "running");
@@ -50,6 +53,24 @@ const filterOptions = [
 ];
 const filterCount = (value: (typeof filterOptions)[number]["value"]) =>
   value === "all" ? skips.value.length : value === "pending" ? pendingSkips.value.length : resolvedSkips.value.length;
+const selectedDepth = computed(() => depthOptions.value.find((item) => item.targetYear === targetYear.value));
+const depthHint = computed(() => {
+  const option = selectedDepth.value;
+  if (!option) return "选择 feeds2 补充源在 mobile 主源受限后继续往旧扫描的深度。";
+  if (option.maxOffset <= 0) return "仅使用 mobile get_feeds 主源；主源深度受限后不会继续 feeds2 深扫。";
+  return `主源受限后启用 feeds2，最大 offset ${option.maxOffset.toLocaleString()}，约可覆盖至 ${option.targetYear} 年及更早的互动记录。`;
+});
+
+async function loadDepthOptions() {
+  try {
+    depthOptions.value = await listArchiveDepthOptions();
+    if (!depthOptions.value.some((item) => item.targetYear === targetYear.value)) {
+      targetYear.value = getArchiveTargetYear();
+    }
+  } catch {
+    depthOptions.value = [];
+  }
+}
 
 async function refresh() {
   try { progress.value = await getArchiveProgress(); } catch { /* 保留当前状态 */ }
@@ -61,7 +82,7 @@ function beginPolling() { window.clearInterval(timer); timer = window.setInterva
 async function start() {
   if (!loggedIn.value) return;
   beginPolling();
-  try { progress.value = await startFeedArchive(getArchiveInterval()); }
+  try { progress.value = await startFeedArchive(getArchiveInterval(), targetYear.value); }
   catch { await refresh(); }
   finally { await refresh(); if (progress.value.status === "limited") beginPolling(); else { window.clearInterval(timer); timer = undefined; } }
 }
@@ -129,7 +150,16 @@ function offsetLabel(item: ArchiveSkipItem) {
   const end = item.cursorOffset + item.offsetAdvance - 1;
   return end > item.cursorOffset ? `${item.cursorOffset}–${end}` : String(item.cursorOffset);
 }
-onMounted(async () => { await refresh(); currentTime.value = Date.now(); if (running.value || rateLimited.value || batchRetrying.value || batchProgress.value) beginPolling(); });
+onMounted(async () => {
+  await Promise.all([refresh(), loadDepthOptions()]);
+  currentTime.value = Date.now();
+  if (running.value || rateLimited.value || batchRetrying.value || batchProgress.value) beginPolling();
+});
+watch(() => user.value?.uin, () => { void refresh(); });
+function onTargetYearChange(value: number) {
+  targetYear.value = value;
+  setArchiveTargetYear(value);
+}
 onBeforeUnmount(() => window.clearInterval(timer));
 </script>
 
@@ -142,6 +172,21 @@ onBeforeUnmount(() => window.clearInterval(timer));
     <div v-if="batchRetrying && batchProgress" class="task-batch-progress"><span><i class="pi pi-spin pi-spinner" /></span><div><strong>{{ batchStopping ? "正在停止批量重试…" : "批量重试异常位置" }}</strong><p>{{ batchProgressText }}{{ batchStopping ? " · 等待当前请求结束后停止" : "" }}</p><ProgressBar :value="(Math.min(batchProgress.current, batchProgress.total) / batchProgress.total) * 100" :show-value="false" style="height: 6px" /></div></div>
     <div class="task-stats"><div><span>已读取页数</span><strong>{{ progress.pages }}</strong></div><div><span>接口记录</span><strong>{{ progress.fetched }}</strong></div><div><span>写入记录</span><strong>{{ progress.saved }}</strong></div><div><span>待重试异常</span><strong>{{ progress.skipped }}</strong></div></div>
     <div v-if="!loggedIn" class="task-login-notice"><span><i class="pi pi-lock" /></span><div><strong>请先登录 QQ 空间</strong><p>登录后才能创建或继续归档任务。</p></div><Button label="立即登录" icon="pi pi-sign-in" size="small" @click="authStore.openLogin" /></div>
+    <div v-else class="task-depth-field">
+      <label for="archive-depth-select">深扫目标</label>
+      <Select
+        id="archive-depth-select"
+        :model-value="targetYear"
+        :options="depthOptions"
+        option-label="label"
+        option-value="targetYear"
+        :disabled="running || batchRetrying"
+        placeholder="选择 feeds2 补充源扫描深度"
+        fluid
+        @update:model-value="onTargetYearChange"
+      />
+      <small>{{ depthHint }}</small>
+    </div>
     <div class="task-actions">
       <Button :label="running ? '归档中…' : batchRetrying ? '批量重试中…' : rateWaiting ? `请等待 ${remainingText}` : rateLimited ? '继续归档' : '开始归档'" icon="pi pi-download" :disabled="running || batchRetrying || rateWaiting || !loggedIn" @click="start" />
       <Button v-if="running" label="取消" icon="pi pi-times" severity="secondary" outlined @click="cancel" />
@@ -180,6 +225,7 @@ onBeforeUnmount(() => window.clearInterval(timer));
   <section class="surface-card task-tips">
     <div class="task-tips-heading"><span><i class="pi pi-info-circle" /></span><h4>温馨提示</h4></div>
     <ul>
+      <li>主源深度受限后，可依据上方<strong>深扫目标</strong>启用 feeds2 补充源继续往旧扫描；越早的年份 offset 越大、耗时越久。</li>
       <li>空间内容的获取基于 QQ 空间的<strong>互动列表</strong>来获取。没有被点赞或评论过的动态无法被恢复。</li>
       <li>出现<strong>频繁提示</strong>时建议换个时间再继续。程序支持<strong>断点续传</strong>，可以接着上次的进度继续归档。</li>
       <li>归档过程中<strong>不要切换 QQ 客户端账号</strong>，否则可能有冻结风险。</li>

@@ -3,7 +3,7 @@ use std::{
     fs,
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicI64, Ordering},
         Mutex,
     },
     time::{SystemTime, UNIX_EPOCH},
@@ -13,6 +13,8 @@ use rusqlite::{params, Connection};
 use serde::Serialize;
 use serde_json::Value;
 use tauri::Manager;
+
+use crate::feeds2;
 
 use crate::{qlogin::QLoginState, qzone};
 
@@ -57,9 +59,11 @@ impl Default for ArchiveProgress {
 
 pub struct ArchiveState {
     progress: Mutex<ArchiveProgress>,
+    progress_owner_uin: Mutex<Option<String>>,
     cancel: AtomicBool,
     batch_retrying: AtomicBool,
     batch_cancel: AtomicBool,
+    feeds2_max_offset: AtomicI64,
     image_downloads: tokio::sync::Semaphore,
 }
 
@@ -67,11 +71,19 @@ impl ArchiveState {
     pub fn new() -> Self {
         Self {
             progress: Mutex::new(ArchiveProgress::default()),
+            progress_owner_uin: Mutex::new(None),
             cancel: AtomicBool::new(false),
             batch_retrying: AtomicBool::new(false),
             batch_cancel: AtomicBool::new(false),
+            feeds2_max_offset: AtomicI64::new(feeds2::recommend_max_offset(
+                feeds2::DEFAULT_ARCHIVE_TARGET_YEAR,
+            )),
             image_downloads: tokio::sync::Semaphore::new(4),
         }
+    }
+
+    fn feeds2_max_offset(&self) -> i64 {
+        self.feeds2_max_offset.load(Ordering::Relaxed)
     }
 }
 
@@ -614,7 +626,6 @@ struct ArchiveCheckpoint {
 
 const ARCHIVE_RATE_WINDOW_SECONDS: i64 = 10 * 60;
 const ARCHIVE_RATE_PAGE_LIMIT: i64 = 300;
-const ARCHIVE_CURSOR_MAX_AGE_SECONDS: i64 = 10 * 60;
 const ARCHIVE_SKIP_MAX_OFFSET_ADVANCE: i64 = 4_096;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -796,8 +807,8 @@ fn record_archive_skip(
     Ok(())
 }
 
-fn checkpoint_is_stale(checkpoint: &ArchiveCheckpoint, current: i64) -> bool {
-    current.saturating_sub(checkpoint.updated_at) >= ARCHIVE_CURSOR_MAX_AGE_SECONDS
+fn checkpoint_is_stale(_checkpoint: &ArchiveCheckpoint, _current: i64) -> bool {
+    false
 }
 
 fn reserve_archive_page(app: &tauri::AppHandle, owner_uin: &str) -> Result<Option<i64>, String> {
@@ -1108,7 +1119,10 @@ pub async fn load_archived_image(
                     reqwest::header::ACCEPT,
                     "image/avif,image/webp,image/png,image/jpeg,image/*,*/*;q=0.8",
                 )
-                .header(reqwest::header::ACCEPT_LANGUAGE, "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6,zh-TW;q=0.5");
+                .header(
+                    reqwest::header::ACCEPT_LANGUAGE,
+                    "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6,zh-TW;q=0.5",
+                );
             if with_cookie {
                 request = request.header(reqwest::header::COOKIE, &auth.cookie_header);
             }
@@ -1254,7 +1268,10 @@ pub async fn load_archived_video(
                     reqwest::header::ACCEPT,
                     "video/mp4,video/*;q=0.9,application/octet-stream;q=0.8,*/*;q=0.5",
                 )
-                .header(reqwest::header::ACCEPT_LANGUAGE, "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6,zh-TW;q=0.5");
+                .header(
+                    reqwest::header::ACCEPT_LANGUAGE,
+                    "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6,zh-TW;q=0.5",
+                );
             if with_cookie {
                 request = request.header(reqwest::header::COOKIE, &auth.cookie_header);
             }
@@ -1326,6 +1343,19 @@ fn concise_archive_error(error: &str) -> String {
     }
 }
 
+enum SkipRecovery {
+    Recovered(qzone::FeedPage, String, i64),
+    SupplementFallback {
+        start_offset: i64,
+        last_error: String,
+    },
+}
+
+enum ArchiveFetchMode {
+    MobileFeeds { cursor: Option<String> },
+    Feeds2Supplement { offset: i64 },
+}
+
 async fn fetch_after_skipped_cursor(
     app: &tauri::AppHandle,
     login: &QLoginState,
@@ -1334,7 +1364,7 @@ async fn fetch_after_skipped_cursor(
     cursor: &str,
     first_advance: i64,
     interval_ms: u64,
-) -> Result<(qzone::FeedPage, String, i64), String> {
+) -> Result<SkipRecovery, String> {
     let first_advance = first_advance.clamp(1, ARCHIVE_SKIP_MAX_OFFSET_ADVANCE);
     let mut last_error = None;
     let mut last_failed_advance = first_advance.saturating_sub(1);
@@ -1365,11 +1395,12 @@ async fn fetch_after_skipped_cursor(
         }
     }
     let Some(mut best) = best else {
-        return Err(format!(
-            "异常位置已保存到待重试列表，但向后探测至偏移 +{} 后仍无法取得下一页：{}",
-            ARCHIVE_SKIP_MAX_OFFSET_ADVANCE,
-            concise_archive_error(last_error.as_deref().unwrap_or("未知接口错误"))
-        ));
+        return Ok(SkipRecovery::SupplementFallback {
+            start_offset: parse_feed_cursor(cursor)
+                .map(|details| details.offset)
+                .unwrap_or(0),
+            last_error: last_error.unwrap_or_else(|| "未知接口错误".into()),
+        });
     };
 
     let mut low = last_failed_advance.saturating_add(1);
@@ -1399,7 +1430,7 @@ async fn fetch_after_skipped_cursor(
         )))
         .await;
     }
-    Ok(best)
+    Ok(SkipRecovery::Recovered(best.0, best.1, best.2))
 }
 
 fn skip_probe_offsets(first_advance: i64) -> Vec<i64> {
@@ -1419,12 +1450,35 @@ fn skip_probe_offsets(first_advance: i64) -> Vec<i64> {
     offsets
 }
 
+fn activate_supplement_mode(
+    archive: &ArchiveState,
+    start_offset: i64,
+    disabled_message: &str,
+) -> Result<Option<ArchiveFetchMode>, String> {
+    if archive.feeds2_max_offset() <= 0 {
+        set_progress(archive, |progress| {
+            progress.status = "completed";
+            progress.message = disabled_message.into();
+        });
+        return Ok(None);
+    }
+    Ok(Some(ArchiveFetchMode::Feeds2Supplement {
+        offset: start_offset,
+    }))
+}
+
+#[tauri::command]
+pub fn list_archive_depth_options() -> Vec<feeds2::ArchiveDepthOption> {
+    feeds2::list_depth_options(feeds2::current_archive_year())
+}
+
 #[tauri::command]
 pub async fn start_feed_archive(
     app: tauri::AppHandle,
     login: tauri::State<'_, QLoginState>,
     archive: tauri::State<'_, ArchiveState>,
     interval_ms: u64,
+    target_year: Option<i32>,
 ) -> Result<ArchiveProgress, String> {
     let interval_ms = interval_ms.clamp(2_000, 30_000);
     if archive.batch_retrying.load(Ordering::Relaxed) {
@@ -1447,33 +1501,70 @@ pub async fn start_feed_archive(
         };
     }
     archive.cancel.store(false, Ordering::Relaxed);
+    let target_year = target_year.unwrap_or(feeds2::DEFAULT_ARCHIVE_TARGET_YEAR);
+    let feeds2_max_offset = feeds2::recommend_max_offset(target_year);
+    archive
+        .feeds2_max_offset
+        .store(feeds2_max_offset, Ordering::Relaxed);
     let owner_uin = login.qzone_auth().await?.uin;
+    if let Ok(mut progress_owner) = archive.progress_owner_uin.lock() {
+        *progress_owner = Some(owner_uin.clone());
+    }
     let saved_skip_count = unresolved_skip_count(&app, &owner_uin)?;
     set_progress(&archive, |progress| progress.skipped = saved_skip_count);
     let checkpoint = load_checkpoint(&app, &owner_uin)?;
-    let stale_checkpoint = checkpoint
-        .as_ref()
-        .is_some_and(|value| checkpoint_is_stale(value, now()));
-    let mut reset_checkpoint_stats = stale_checkpoint;
-    let mut cursor = checkpoint
-        .as_ref()
-        .filter(|_| !stale_checkpoint)
-        .map(|value| value.cursor.clone());
+    let mut reset_checkpoint_stats = false;
+    let mut mode = if let Some(checkpoint) = checkpoint.as_ref() {
+        if let Some(offset) = feeds2::parse_supplement_checkpoint(&checkpoint.cursor) {
+            ArchiveFetchMode::Feeds2Supplement { offset }
+        } else {
+            ArchiveFetchMode::MobileFeeds {
+                cursor: Some(checkpoint.cursor.clone()),
+            }
+        }
+    } else {
+        ArchiveFetchMode::MobileFeeds { cursor: None }
+    };
     let mut seen_cursors = HashSet::new();
-    if stale_checkpoint {
+    let mut supplement_active = matches!(mode, ArchiveFetchMode::Feeds2Supplement { .. });
+    if feeds2_max_offset <= 0 {
         set_progress(&archive, |progress| {
             progress.message =
-                "上次分页位置已超过 10 分钟，正在从第一页重新校验；已保存记录会自动去重。".into();
+                "已选择仅主源模式：mobile get_feeds 扫描完成后不会启用 feeds2 深扫。".into();
         });
-    } else if let Some(checkpoint) = checkpoint.as_ref() {
-        let saved_cursor = &checkpoint.cursor;
-        seen_cursors.insert(saved_cursor.clone());
+    } else {
         set_progress(&archive, |progress| {
-            progress.pages = checkpoint.pages;
-            progress.fetched = checkpoint.fetched;
-            progress.saved = checkpoint.saved;
-            progress.message = format!("已恢复上次进度：{} 页，正在继续归档…", checkpoint.pages);
+            progress.message = format!(
+                "已设置 feeds2 深扫目标：{target_year} 年及更早（offset ≤ {feeds2_max_offset}）"
+            );
         });
+    }
+    if let Some(checkpoint) = checkpoint.as_ref() {
+        if supplement_active {
+            if let ArchiveFetchMode::Feeds2Supplement { offset } = &mode {
+                set_progress(&archive, |progress| {
+                    progress.pages = checkpoint.pages;
+                    progress.fetched = checkpoint.fetched;
+                    progress.saved = checkpoint.saved;
+                    progress.message = format!(
+                        "已恢复 feeds2 补充源进度（offset {offset}）：{} 页，正在继续归档…",
+                        checkpoint.pages
+                    );
+                });
+            }
+        } else if let ArchiveFetchMode::MobileFeeds {
+            cursor: Some(saved_cursor),
+        } = &mode
+        {
+            seen_cursors.insert(saved_cursor.clone());
+            set_progress(&archive, |progress| {
+                progress.pages = checkpoint.pages;
+                progress.fetched = checkpoint.fetched;
+                progress.saved = checkpoint.saved;
+                progress.message =
+                    format!("已恢复上次进度：{} 页，正在继续归档…", checkpoint.pages);
+            });
+        }
     }
     let result: Result<(), String> = async {
         loop {
@@ -1483,8 +1574,64 @@ pub async fn start_feed_archive(
             if let Some(retry_at) = reserve_archive_page(&app, &owner_uin)? {
                 return Err(format!("ARCHIVE_RATE_LIMIT:{retry_at}"));
             }
+
+            if let ArchiveFetchMode::Feeds2Supplement { offset } = mode {
+                if !supplement_active {
+                    supplement_active = true;
+                    set_progress(&archive, |progress| {
+                        progress.message = format!(
+                            "mobile get_feeds 深度分页受限，已切换 feeds2 补充源继续归档（offset {offset}）…"
+                        );
+                    });
+                }
+                let page = feeds2::fetch_supplement_page(&login, offset, archive.feeds2_max_offset()).await?;
+                let fetched = page.feeds.len() as u64;
+                let next_checkpoint = if page.has_more {
+                    Some(feeds2::format_supplement_checkpoint(page.next_offset))
+                } else {
+                    None
+                };
+                let saved = save_page(
+                    &app,
+                    &owner_uin,
+                    &page.feeds,
+                    next_checkpoint.as_deref(),
+                    reset_checkpoint_stats,
+                )?;
+                reset_checkpoint_stats = false;
+                set_progress(&archive, |progress| {
+                    progress.pages += 1;
+                    progress.fetched += fetched;
+                    progress.saved += saved;
+                    progress.message = format!(
+                        "feeds2 补充源：offset {offset}，已归档 {} 页，共 {} 条记录",
+                        progress.pages, progress.fetched
+                    );
+                });
+                if !page.has_more {
+                    return Ok(());
+                }
+                mode = ArchiveFetchMode::Feeds2Supplement {
+                    offset: page.next_offset,
+                };
+                tokio::time::sleep(std::time::Duration::from_millis(archive_page_delay_ms(
+                    interval_ms,
+                )))
+                .await;
+                continue;
+            }
+
+            let ArchiveFetchMode::MobileFeeds { cursor } = mode else {
+                continue;
+            };
             let mut skipped_page: Option<(String, String, FeedCursorDetails, i64, String)> = None;
             let page = if let Some(current_cursor) = cursor.as_deref() {
+                if feeds2::is_supplement_checkpoint(current_cursor) {
+                    mode = ArchiveFetchMode::Feeds2Supplement {
+                        offset: feeds2::parse_supplement_checkpoint(current_cursor).unwrap_or(0),
+                    };
+                    continue;
+                }
                 let known_skip = match parse_feed_cursor(current_cursor) {
                     Ok(details) => {
                         known_skip_advance(&app, &owner_uin, details)?.map(|known| (details, known))
@@ -1492,7 +1639,7 @@ pub async fn start_feed_archive(
                     Err(_) => None,
                 };
                 if let Some((details, (known_advance, known_error))) = known_skip {
-                    let (page, resume_cursor, offset_advance) = fetch_after_skipped_cursor(
+                    match fetch_after_skipped_cursor(
                         &app,
                         &login,
                         &archive,
@@ -1501,15 +1648,58 @@ pub async fn start_feed_archive(
                         known_advance,
                         interval_ms,
                     )
-                    .await?;
-                    skipped_page = Some((
-                        current_cursor.to_owned(),
-                        resume_cursor,
-                        details,
-                        offset_advance,
-                        known_error,
-                    ));
-                    page
+                    .await?
+                    {
+                        SkipRecovery::Recovered(page, resume_cursor, offset_advance) => {
+                            skipped_page = Some((
+                                current_cursor.to_owned(),
+                                resume_cursor,
+                                details,
+                                offset_advance,
+                                known_error,
+                            ));
+                            page
+                        }
+                        SkipRecovery::SupplementFallback {
+                            start_offset,
+                            last_error,
+                        } => {
+                            record_archive_skip(
+                                &app,
+                                &owner_uin,
+                                SkipRecord {
+                                    cursor: current_cursor,
+                                    resume_cursor: &feeds2::format_supplement_checkpoint(start_offset),
+                                    page_number: archive
+                                        .progress
+                                        .lock()
+                                        .map_err(|_| "归档状态锁已损坏")?
+                                        .pages
+                                        .saturating_add(1),
+                                    details,
+                                    offset_advance: 0,
+                                    error: &format!(
+                                        "{}；已切换 feeds2 补充源（offset {start_offset}）",
+                                        concise_archive_error(&last_error)
+                                    ),
+                                },
+                            )?;
+                            match activate_supplement_mode(
+                                &archive,
+                                start_offset,
+                                &format!(
+                                    "{}；未启用 feeds2 深扫，归档结束",
+                                    concise_archive_error(&last_error)
+                                ),
+                            )? {
+                                Some(next_mode) => {
+                                    mode = next_mode;
+                                    continue;
+                                }
+                                None => return Ok(()),
+                            }
+                        }
+                    }
                 } else {
                     match qzone::fetch_feeds(&login, "2", Some(current_cursor)).await {
                         Ok(page) => page,
@@ -1543,7 +1733,7 @@ pub async fn start_feed_archive(
                                     "第 {page_number} 页发生异常，已加入待重试列表，正在寻找后续可恢复位置…"
                                 );
                             });
-                            let (page, resume_cursor, offset_advance) = fetch_after_skipped_cursor(
+                            match fetch_after_skipped_cursor(
                                 &app,
                                 &login,
                                 &archive,
@@ -1552,15 +1742,61 @@ pub async fn start_feed_archive(
                                 1,
                                 interval_ms,
                             )
-                            .await?;
-                            skipped_page = Some((
-                                current_cursor.to_owned(),
-                                resume_cursor,
-                                details,
-                                offset_advance,
-                                error,
-                            ));
-                            page
+                            .await?
+                            {
+                                SkipRecovery::Recovered(page, resume_cursor, offset_advance) => {
+                                    skipped_page = Some((
+                                        current_cursor.to_owned(),
+                                        resume_cursor,
+                                        details,
+                                        offset_advance,
+                                        error,
+                                    ));
+                                    page
+                                }
+                                SkipRecovery::SupplementFallback {
+                                    start_offset,
+                                    last_error,
+                                } => {
+                                    record_archive_skip(
+                                        &app,
+                                        &owner_uin,
+                                        SkipRecord {
+                                            cursor: current_cursor,
+                                            resume_cursor: &feeds2::format_supplement_checkpoint(
+                                                start_offset,
+                                            ),
+                                            page_number,
+                                            details,
+                                            offset_advance: 0,
+                                            error: &format!(
+                                                "{}；已切换 feeds2 补充源（offset {start_offset}）",
+                                                concise_archive_error(&last_error)
+                                            ),
+                                        },
+                                    )?;
+                                    let skip_count = unresolved_skip_count(&app, &owner_uin)?;
+                                    set_progress(&archive, |progress| {
+                                        progress.skipped = skip_count;
+                                        progress.message = format!(
+                                            "mobile get_feeds 在 offset {start_offset} 受限，已切换 feeds2 补充源继续归档…"
+                                        );
+                                    });
+                                    match activate_supplement_mode(
+                                        &archive,
+                                        start_offset,
+                                        &format!(
+                                            "mobile get_feeds 在 offset {start_offset} 受限；未启用 feeds2 深扫，归档结束"
+                                        ),
+                                    )? {
+                                        Some(next_mode) => {
+                                            mode = next_mode;
+                                            continue;
+                                        }
+                                        None => return Ok(()),
+                                    }
+                                }
+                            }
                         }
                         Err(error) => return Err(error),
                     }
@@ -1654,7 +1890,9 @@ pub async fn start_feed_archive(
             if !page.has_more {
                 return Ok(());
             }
-            cursor = next.map(str::to_owned);
+            mode = ArchiveFetchMode::MobileFeeds {
+                cursor: next.map(str::to_owned),
+            };
             tokio::time::sleep(std::time::Duration::from_millis(archive_page_delay_ms(
                 interval_ms,
             )))
@@ -1675,6 +1913,8 @@ pub async fn start_feed_archive(
                     "归档完成，共保存 {} 条记录；另有 {} 个异常位置已跳过，可在下方单独重试",
                     p.saved, p.skipped
                 )
+            } else if supplement_active {
+                format!("归档完成（含 feeds2 补充源），共保存 {} 条记录", p.saved)
             } else {
                 format!("归档完成，共保存 {} 条记录", p.saved)
             };
@@ -1722,15 +1962,67 @@ pub async fn start_feed_archive(
     }
 }
 
+fn hydrate_progress_from_owner(
+    app: &tauri::AppHandle,
+    owner_uin: &str,
+) -> Result<ArchiveProgress, String> {
+    let mut progress = ArchiveProgress::default();
+    if let Some(checkpoint) = load_checkpoint(app, owner_uin)? {
+        progress.pages = checkpoint.pages;
+        progress.fetched = checkpoint.fetched;
+        progress.saved = checkpoint.saved;
+        progress.skipped = unresolved_skip_count(app, owner_uin)? as u32;
+        if !checkpoint.cursor.trim().is_empty() {
+            progress.message = format!(
+                "上次归档到第 {} 页（{} 条），点击「开始归档」可继续",
+                checkpoint.pages, checkpoint.saved
+            );
+        }
+    }
+    Ok(progress)
+}
+
 #[tauri::command]
-pub fn get_archive_progress(
+pub fn reset_archive_session(state: tauri::State<'_, ArchiveState>) {
+    state.cancel.store(true, Ordering::Relaxed);
+    state.batch_cancel.store(true, Ordering::Relaxed);
+    if let Ok(mut progress) = state.progress.lock() {
+        *progress = ArchiveProgress::default();
+    }
+    if let Ok(mut owner) = state.progress_owner_uin.lock() {
+        *owner = None;
+    }
+}
+
+#[tauri::command]
+pub async fn get_archive_progress(
+    app: tauri::AppHandle,
+    login: tauri::State<'_, QLoginState>,
     state: tauri::State<'_, ArchiveState>,
 ) -> Result<ArchiveProgress, String> {
-    state
+    let auth = login.qzone_auth().await.ok();
+    let Some(owner_uin) = auth.map(|value| value.uin) else {
+        return Ok(ArchiveProgress::default());
+    };
+
+    let progress = state
         .progress
         .lock()
         .map(|value| value.clone())
-        .map_err(|_| "归档状态锁已损坏".into())
+        .map_err(|_| "归档状态锁已损坏".to_string())?;
+    let progress_owner = state
+        .progress_owner_uin
+        .lock()
+        .map_err(|_| "归档状态锁已损坏".to_string())?
+        .clone();
+    let active_for_current = matches!(progress.status, "running" | "limited")
+        && progress_owner.as_deref() == Some(owner_uin.as_str());
+
+    if active_for_current {
+        return Ok(progress);
+    }
+
+    hydrate_progress_from_owner(&app, &owner_uin)
 }
 
 #[tauri::command]
@@ -1875,7 +2167,8 @@ pub async fn retry_all_archive_skips(
                 });
             }
             Err(error) => {
-                if error.starts_with("请求频率保护中") || error.starts_with("归档任务运行中") {
+                if error.starts_with("请求频率保护中") || error.starts_with("归档任务运行中")
+                {
                     break;
                 }
                 result.failed += 1;
@@ -2193,18 +2486,20 @@ pub async fn get_archived_feed(
          WHERE owner_uin=?1 AND cell_id=?2 AND event_type IN (2,311) ORDER BY event_time ASC",
         )
         .map_err(|error| format!("准备评论查询失败：{error}"))?;
-    item.comments = merge_comments(comments
-        .query_map(params![item.owner_uin, item.cell_id], |row| {
-            Ok(comment_from_values(
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-            ))
-        })
-        .map_err(|error| format!("查询动态评论失败：{error}"))?
-        .filter_map(Result::ok));
+    item.comments = merge_comments(
+        comments
+            .query_map(params![item.owner_uin, item.cell_id], |row| {
+                Ok(comment_from_values(
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
+            .map_err(|error| format!("查询动态评论失败：{error}"))?
+            .filter_map(Result::ok),
+    );
     drop(comments);
     let mut likes_stmt = connection
         .prepare(
@@ -2648,15 +2943,15 @@ pub async fn count_archived_feeds(
     validate_category(&category)?;
     let owner_uin = login.qzone_auth().await?.uin;
     tauri::async_runtime::spawn_blocking(move || {
-    let connection = open_database(&app)?;
-    connection
-        .query_row(
-            "SELECT COUNT(*) FROM archive_dynamics WHERE owner_uin=?1 AND category=?2",
-            params![owner_uin, category],
-            |row| row.get::<_, i64>(0),
-        )
-        .map(|count| count.max(0) as u64)
-        .map_err(|error| format!("统计归档数量失败：{error}"))
+        let connection = open_database(&app)?;
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM archive_dynamics WHERE owner_uin=?1 AND category=?2",
+                params![owner_uin, category],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|count| count.max(0) as u64)
+            .map_err(|error| format!("统计归档数量失败：{error}"))
     })
     .await
     .map_err(|error| format!("归档统计任务异常退出：{error}"))?
@@ -3164,7 +3459,7 @@ mod tests {
         };
 
         assert!(!checkpoint_is_stale(&checkpoint, 1_599));
-        assert!(checkpoint_is_stale(&checkpoint, 1_600));
+        assert!(!checkpoint_is_stale(&checkpoint, 999_999));
     }
 
     #[test]
